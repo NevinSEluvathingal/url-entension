@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
@@ -45,7 +46,7 @@ func init() {
 func createTables() {
 	query := `
 	CREATE TABLE IF NOT EXISTS comments (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id INTEGER PRIMARY KEY,
 		url TEXT NOT NULL,
 		parent_id INTEGER,
 		username TEXT NOT NULL,
@@ -57,7 +58,7 @@ func createTables() {
 	);
 
 	CREATE TABLE IF NOT EXISTS comment_likes (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id INTEGER PRIMARY KEY,
 		comment_id INTEGER NOT NULL,
 		is_like BOOLEAN NOT NULL,
 		FOREIGN KEY (comment_id) REFERENCES comments(id)
@@ -76,10 +77,12 @@ func main() {
 	// Apply CORS middleware to all routes
 	r.Use(corsMiddleware)
 
+	// Define Routes
 	r.HandleFunc("/comments", getComments).Methods("GET")
 	r.HandleFunc("/replies/{comment_id}", getReplies).Methods("GET")
 	r.HandleFunc("/comments", postComment).Methods("POST")
 
+	// Start Server
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
@@ -105,11 +108,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // Get main comments for a URL
 func getComments(w http.ResponseWriter, r *http.Request) {
-	url := r.URL.Query().Get("url")
-	if url == "" {
-		http.Error(w, "URL parameter is required", http.StatusBadRequest)
+	// Decode URL parameter
+	urlParam := r.URL.Query().Get("url")
+	// Decode the URL to handle any encoded characters
+	decodedURL, err := url.QueryUnescape(urlParam)
+	if err != nil {
+		http.Error(w, "Error decoding URL", http.StatusBadRequest)
+		log.Println(err)
 		return
 	}
+
+	log.Printf("Fetching comments for URL: %s", decodedURL)
 
 	query := `
 	SELECT c.id, c.parent_id, c.comment, c.created_at, c.username, c.profile_pic, c.sentiment_score,
@@ -121,7 +130,7 @@ func getComments(w http.ResponseWriter, r *http.Request) {
 	ORDER BY c.created_at ASC;
 	`
 
-	rows, err := db.Query(query, url)
+	rows, err := db.Query(query, decodedURL)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		log.Println(err)
@@ -139,7 +148,8 @@ func getComments(w http.ResponseWriter, r *http.Request) {
 		}
 		comments = append(comments, c)
 	}
-	log.Println(comments)
+
+	log.Printf("Comments retrieved: %+v", comments)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(comments)
 }
@@ -177,31 +187,31 @@ func getReplies(w http.ResponseWriter, r *http.Request) {
 		replies = append(replies, c)
 	}
 
+	log.Printf("Replies retrieved: %+v", replies)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(replies)
 }
 
-// Post a new comment
+// Post a new comment with a provided ID from the frontend
 func postComment(w http.ResponseWriter, r *http.Request) {
 	var c Comment
 	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	log.Println(c)
+	log.Printf("Received comment: %+v", c)
 
-	if c.URL == "" || c.Comment == "" || c.Username == "" {
-		http.Error(w, "Missing required fields", http.StatusBadRequest)
+	// Ensure that the required fields are provided
+	if c.URL == "" || c.Comment == "" || c.Username == "" || c.ID == 0 {
+		http.Error(w, "Missing required fields (including ID)", http.StatusBadRequest)
 		return
 	}
-
 	query := `
-	INSERT INTO comments (url, parent_id, username, profile_pic, comment, sentiment_score) 
-	VALUES (?, ?, ?, ?, ?, ?) RETURNING id;
+	INSERT INTO comments (id, url, parent_id, username, profile_pic, comment, sentiment_score) 
+	VALUES (?, ?, ?, ?, ?, ?, ?);
 	`
 
-	var commentID int
-	err := db.QueryRow(query, c.URL, c.ParentID, c.Username, c.ProfilePic, c.Comment, c.SentimentScore).Scan(&commentID)
+	_, err := db.Exec(query, c.ID, c.URL, c.ParentID, c.Username, c.ProfilePic, c.Comment, c.SentimentScore)
 	if err != nil {
 		http.Error(w, "Database insert error", http.StatusInternalServerError)
 		log.Println(err)
@@ -209,6 +219,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]int{"comment_id": commentID})
+	// Send back the comment ID that was inserted
+	json.NewEncoder(w).Encode(map[string]int{"comment_id": c.ID})
 }
 
