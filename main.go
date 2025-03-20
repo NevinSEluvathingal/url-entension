@@ -112,7 +112,7 @@ func main() {
 	r.HandleFunc("/replies/{parent_id}", postReply).Methods("POST")
 	r.HandleFunc("/comment_like", commentLike).Methods("POST") 
 	r.HandleFunc("/connect_users", connectUsers).Methods("POST")
-	r.HandleFunc("/comments_by_connections/{userID}", getCommentsByConnections).Methods("GET")
+	r.HandleFunc("/comments_by_connections", getCommentsByConnections).Methods("GET")
 	
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -149,6 +149,7 @@ func connectUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	log.Println(request)
 
 	session := neo4jDriver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 	defer session.Close()
@@ -171,10 +172,15 @@ func connectUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	userID, err := strconv.Atoi(vars["userID"])
+	urlParam := r.URL.Query().Get("url")
+	IDparam := r.URL.Query().Get("user_id")
+
+	decodedURL, err := url.QueryUnescape(urlParam)
+	userID, err := strconv.Atoi(IDparam)
+	log.Println("user IDs::::::::::::::::::::::::::", userID)
 	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		http.Error(w, "Error decoding URL", http.StatusBadRequest)
+		log.Println(err)
 		return
 	}
 
@@ -196,11 +202,15 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 	var userIDs []int
 	for result.Next() {
 		if id, ok := result.Record().Get("userID"); ok {
+			log.Println("Connected user IDs:", id)
 			if intID, ok := id.(int64); ok {
 				userIDs = append(userIDs, int(intID))
+				
 			}
 		}
 	}
+
+	
 
 	if len(userIDs) == 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -208,8 +218,10 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build SQL query with placeholders for user IDs
 	queryStr := "SELECT id, url, parent_id, user_id, username, profile_pic, comment, created_at, sentiment_score FROM comments WHERE user_id IN ("
 	args := []interface{}{}
+
 	for i, id := range userIDs {
 		if i > 0 {
 			queryStr += ","
@@ -217,7 +229,9 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 		queryStr += "?"
 		args = append(args, id)
 	}
-	queryStr += ")"
+
+	queryStr += ") AND url = ?" // Add URL filtering
+	args = append(args, decodedURL) // Append the URL to the query parameters
 
 	rows, err := db.Query(queryStr, args...)
 	if err != nil {
@@ -227,18 +241,18 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var replie []Comment
+	var comments []Comment
 	for rows.Next() {
 		var c Comment
 		if err := rows.Scan(&c.ID, &c.URL, &c.ParentID, &c.UserID, &c.Username, &c.ProfilePic, &c.Comment, &c.CreatedAt, &c.SentimentScore); err != nil {
 			log.Println("Error scanning comment:", err)
 			continue
 		}
-		replie = append(replie, c)
+		comments = append(comments, c)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(replie)
+	json.NewEncoder(w).Encode(comments)
 }
 
 // Login route to create or fetch a user
