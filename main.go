@@ -38,6 +38,7 @@ type Comment struct {
 	LikeCount      int    `json:"like_count"`
 	DislikeCount   int    `json:"dislike_count"`
 	LikeStatus     *bool   `json:"like_status"`
+	ConStatus      *bool   `json:"con_status"`
 	URL            string `json:"url,omitempty"`
 }
 
@@ -90,6 +91,11 @@ func createTables() {
 		FOREIGN KEY (comment_id) REFERENCES comments(id),
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
+	
+	CREATE TABLE IF NOT EXISTS connection (
+		user_id INTEGER NOT NULL,
+		comment_id INTEGER NOT NULL
+	)	
 	`
 
 	_, err := db.Exec(query)
@@ -143,18 +149,29 @@ func connectUsers(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		UserID1 int `json:"user_id_1"`
 		UserID2 int `json:"user_id_2"`
+		ComID   int `json:"com_id"`
 	}
+	
+	
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 	log.Println(request)
+	
+	query := `INSERT INTO connection (user_id, comment_id) VALUES (?, ?)`
+        _, err := db.Exec(query, request.UserID1, request.ComID)
+        if err != nil {
+            http.Error(w, "Error inserting comment table", http.StatusInternalServerError)
+            log.Println(err)
+            return
+        }
 
 	session := neo4jDriver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 	defer session.Close()
 
-	_, err := session.Run(
+	_, err = session.Run(
 		"MERGE (u1:User {id: $userID1}) MERGE (u2:User {id: $userID2}) MERGE (u1)-[:CONNECTED]->(u2)",
 		map[string]interface{}{
 			"userID1": request.UserID1,
@@ -177,9 +194,8 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 
 	decodedURL, err := url.QueryUnescape(urlParam)
 	userID, err := strconv.Atoi(IDparam)
-	log.Println("user IDs::::::::::::::::::::::::::", userID)
 	if err != nil {
-		http.Error(w, "Error decoding URL", http.StatusBadRequest)
+		http.Error(w, "Error decoding user ID", http.StatusBadRequest)
 		log.Println(err)
 		return
 	}
@@ -205,12 +221,9 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 			log.Println("Connected user IDs:", id)
 			if intID, ok := id.(int64); ok {
 				userIDs = append(userIDs, int(intID))
-				
 			}
 		}
 	}
-
-	
 
 	if len(userIDs) == 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -219,15 +232,25 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build SQL query with placeholders for user IDs
-	queryStr := "SELECT id, url, parent_id, user_id, username, profile_pic, comment, created_at, sentiment_score FROM comments WHERE user_id IN ("
-	args := []interface{}{}
+	queryStr := `
+		SELECT c.id, c.user_id, c.parent_id, c.username, c.profile_pic, c.comment, c.created_at, c.sentiment_score,
+		       (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id) AS reply_count,
+		       (SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id AND cl.is_like = 1) AS like_count,
+		       (SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id AND cl.is_like = 0) AS dislike_count,
+		       (SELECT is_like FROM comment_likes cl WHERE cl.comment_id = c.id AND cl.user_id = ?) AS like_status,
+		       EXISTS (
+		       		SELECT 1 FROM connection WHERE user_id = ? AND comment_id = c.id
+		       ) AS row_exists
+		FROM comments c WHERE c.user_id IN (`
+
+	args := []interface{}{userID, userID} // Pass userID for the first two `?` placeholders
 
 	for i, id := range userIDs {
 		if i > 0 {
 			queryStr += ","
 		}
 		queryStr += "?"
-		args = append(args, id)
+		args = append(args, id) // Append user IDs to match `?` placeholders
 	}
 
 	queryStr += ") AND url = ?" // Add URL filtering
@@ -244,7 +267,11 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 	var comments []Comment
 	for rows.Next() {
 		var c Comment
-		if err := rows.Scan(&c.ID, &c.URL, &c.ParentID, &c.UserID, &c.Username, &c.ProfilePic, &c.Comment, &c.CreatedAt, &c.SentimentScore); err != nil {
+		if err := rows.Scan(
+			&c.ID, &c.UserID, &c.ParentID, &c.Username, &c.ProfilePic,
+			&c.Comment, &c.CreatedAt, &c.SentimentScore, &c.ReplyCount,
+			&c.LikeCount, &c.DislikeCount, &c.LikeStatus, &c.ConStatus,
+		); err != nil {
 			log.Println("Error scanning comment:", err)
 			continue
 		}
@@ -314,13 +341,17 @@ func getComments(w http.ResponseWriter, r *http.Request) {
 	       (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id) AS reply_count,
 	       (SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id AND cl.is_like = 1) AS like_count,
 	       (SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id AND cl.is_like = 0) AS dislike_count,
-	       (SELECT is_like FROM comment_likes cl WHERE cl.comment_id=c.id AND cl.user_id=?) AS like_status
+	       (SELECT is_like FROM comment_likes cl WHERE cl.comment_id=c.id AND cl.user_id=?) AS like_status,
+	       (SELECT EXISTS(
+    			SELECT 1 FROM connection WHERE user_id = ? AND comment_id = c.id
+		)) AS row_exists
+	       
 	FROM comments c
 	WHERE c.url = ? AND c.parent_id IS NULL
 	ORDER BY c.created_at ASC;
 	`
 
-	rows, err := db.Query(query, decodedID, decodedURL)
+	rows, err := db.Query(query, decodedID, decodedID, decodedURL)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		log.Println(err)
@@ -331,7 +362,7 @@ func getComments(w http.ResponseWriter, r *http.Request) {
 	var comments []Comment
 	for rows.Next() {
 		var c Comment
-		if err := rows.Scan(&c.ID, &c.UserID, &c.ParentID, &c.Comment, &c.CreatedAt, &c.Username, &c.ProfilePic, &c.SentimentScore, &c.ReplyCount, &c.LikeCount, &c.DislikeCount, &c.LikeStatus); err != nil {
+		if err := rows.Scan(&c.ID, &c.UserID, &c.ParentID, &c.Comment, &c.CreatedAt, &c.Username, &c.ProfilePic, &c.SentimentScore, &c.ReplyCount, &c.LikeCount, &c.DislikeCount, &c.LikeStatus,&c.ConStatus); err != nil {
 			http.Error(w, "Error scanning results", http.StatusInternalServerError)
 			log.Println(err)
 			return
