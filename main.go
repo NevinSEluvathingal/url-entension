@@ -119,6 +119,7 @@ func main() {
 	r.HandleFunc("/comment_like", commentLike).Methods("POST") 
 	r.HandleFunc("/connect_users", connectUsers).Methods("POST")
 	r.HandleFunc("/comments_by_connections", getCommentsByConnections).Methods("GET")
+	r.HandleFunc("/disconnect_users", disconnectUsers).Methods("DELETE")
 	
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -187,6 +188,50 @@ func connectUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "Users connected"})
 }
+
+func disconnectUsers(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		UserID1 int `json:"user_id_1"`
+		UserID2 int `json:"user_id_2"`
+		ComID   int `json:"com_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	log.Println("Disconnecting:", request)
+
+	// Remove from SQL database
+	query := `DELETE FROM connection WHERE user_id = ? AND comment_id = ?`
+	_, err := db.Exec(query, request.UserID1, request.ComID)
+	if err != nil {
+		http.Error(w, "Error deleting from connection table", http.StatusInternalServerError)
+		log.Println(err)
+		return
+	}
+
+	// Remove from Neo4j graph
+	session := neo4jDriver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close()
+
+	_, err = session.Run(
+		`MATCH (u1:User {id: $userID1})-[r:CONNECTED]-(u2:User {id: $userID2}) DELETE r`,
+		map[string]interface{}{
+			"userID1": request.UserID1,
+			"userID2": request.UserID2,
+		},
+	)
+	if err != nil {
+		http.Error(w, "Failed to disconnect users", http.StatusInternalServerError)
+		log.Println(err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "Users disconnected"})
+}
+
 
 func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 	urlParam := r.URL.Query().Get("url")
