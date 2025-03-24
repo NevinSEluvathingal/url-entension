@@ -10,6 +10,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"strconv"
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
+	"io"
+	"bytes"
 
 )
 
@@ -95,8 +97,12 @@ func createTables() {
 	CREATE TABLE IF NOT EXISTS connection (
 		user_id INTEGER NOT NULL,
 		comment_id INTEGER NOT NULL
-	)	
-	`
+	);	
+	
+	CREATE TABLE IF NOT EXISTS summaries (
+        url TEXT PRIMARY KEY,
+        summary TEXT NOT NULL
+        );`
 
 	_, err := db.Exec(query)
 	if err != nil {
@@ -120,6 +126,7 @@ func main() {
 	r.HandleFunc("/connect_users", connectUsers).Methods("POST")
 	r.HandleFunc("/comments_by_connections", getCommentsByConnections).Methods("GET")
 	r.HandleFunc("/disconnect_users", disconnectUsers).Methods("DELETE")
+	r.HandleFunc("/comment_summary", getCommentSummary).Methods("GET")
 	
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -450,6 +457,88 @@ func getReplies(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(replies)
 }
 
+func getCommentSummary(w http.ResponseWriter, r *http.Request) {
+    urlParam := r.URL.Query().Get("url")
+    decodedURL, err := url.QueryUnescape(urlParam)
+    if err != nil {
+        http.Error(w, "Error decoding URL", http.StatusBadRequest)
+        log.Println(err)
+        return
+    }
+
+    // Check if summary exists in database
+    var existingSummary string
+    err = db.QueryRow("SELECT summary FROM summaries WHERE url = ?", decodedURL).Scan(&existingSummary)
+    if err == nil {
+        log.Println("Returning cached summary")
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"summary": existingSummary})
+        return
+    }
+
+    // Retrieve comments from database
+    query := `SELECT comment FROM comments WHERE url = ?`
+    rows, err := db.Query(query, decodedURL)
+    if err != nil {
+        http.Error(w, "Database error", http.StatusInternalServerError)
+        log.Println(err)
+        return
+    }
+    defer rows.Close()
+
+    var comments []string
+    for rows.Next() {
+        var comment string
+        if err := rows.Scan(&comment); err != nil {
+            http.Error(w, "Error scanning results", http.StatusInternalServerError)
+            log.Println(err)
+            return
+        }
+        comments = append(comments, comment)
+    }
+
+    requestBody, err := json.Marshal(map[string][]string{"messages": comments})
+    if err != nil {
+        http.Error(w, "Error encoding JSON", http.StatusInternalServerError)
+        log.Println(err)
+        return
+    }
+
+    summaryURL := "http://localhost:6000/summarize"
+    resp, err := http.Post(summaryURL, "application/json", bytes.NewBuffer(requestBody))
+    if err != nil {
+        http.Error(w, "Error calling summarize service", http.StatusInternalServerError)
+        log.Println(err)
+        return
+    }
+    defer resp.Body.Close()
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        http.Error(w, "Error reading summarize response", http.StatusInternalServerError)
+        log.Println(err)
+        return
+    }
+
+    var summaryResponse map[string]string
+    if err := json.Unmarshal(body, &summaryResponse); err != nil {
+        http.Error(w, "Error decoding summarize response", http.StatusInternalServerError)
+        log.Println(err)
+        return
+    }
+
+    summary := summaryResponse["summary"]
+
+    // Store the new summary in the database
+    _, err = db.Exec("INSERT INTO summaries (url, summary) VALUES (?, ?)", decodedURL, summary)
+    if err != nil {
+        log.Println("Error storing summary in database:", err)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.Write(body)
+}
+
 // Post a comment
 func postComment(w http.ResponseWriter, r *http.Request) {
     var c Comment
@@ -483,10 +572,58 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 
     
     c.ID = int(commentID)
+    
+    var count int
+    db.QueryRow("SELECT COUNT(*) FROM comments WHERE url = ?", c.URL).Scan(&count)
+    if count%5 == 0 {
+        go updateSummary(c.URL)
+    }
 
     
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]int{"comment_id": c.ID})
+}
+
+func updateSummary(url string) {
+    rows, err := db.Query("SELECT comment FROM comments WHERE url = ?", url)
+    if err != nil {
+        log.Println("Error fetching comments for summary update:", err)
+        return
+    }
+    defer rows.Close()
+
+    var comments []string
+    for rows.Next() {
+        var comment string
+        if err := rows.Scan(&comment); err != nil {
+            log.Println("Error scanning results:", err)
+            return
+        }
+        comments = append(comments, comment)
+    }
+
+    if len(comments) == 0 {
+        return
+    }
+
+    requestBody, _ := json.Marshal(map[string][]string{"messages": comments})
+    resp, err := http.Post("http://localhost:6000/summarize", "application/json", bytes.NewBuffer(requestBody))
+    if err != nil {
+        log.Println("Error calling summarize service:", err)
+        return
+    }
+    defer resp.Body.Close()
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        log.Println("Error reading summarize response:", err)
+        return
+    }
+
+    _, err = db.Exec("INSERT INTO summaries (url, summary) VALUES (?, ?) ON CONFLICT(url) DO UPDATE SET summary = ?", url, string(body), string(body))
+    if err != nil {
+        log.Println("Error updating summary table:", err)
+    }
 }
 
 // Post a reply
