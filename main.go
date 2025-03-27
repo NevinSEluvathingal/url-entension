@@ -12,7 +12,9 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v4/neo4j"
 	"io"
 	"bytes"
-
+	"time"
+	"math/rand"
+	"fmt"
 )
 
 
@@ -58,7 +60,7 @@ func init() {
 	createTables()
 	
 		
-	neo4jDriver, err = neo4j.NewDriver("neo4j://localhost:7687", neo4j.BasicAuth("neo4j", "nevin1704%", ""))
+	neo4jDriver, err = neo4j.NewDriver("neo4j+s://990afffb.databases.neo4j.io", neo4j.BasicAuth("neo4j", "C84lgfI-kHXJKLSBx6ncDC-ZRjuBdxSytWtvLTGYawc", ""))
 	if err != nil {
 		log.Fatal("Error connecting to Neo4j:", err)
 	}
@@ -114,7 +116,7 @@ func main() {
 	r := mux.NewRouter()
 
 	
-	r.Use(enableCORS)
+	//r.Use(enableCORS)
 
 	// Define Routes
 	r.HandleFunc("/login/{username}", login).Methods("GET")
@@ -127,9 +129,10 @@ func main() {
 	r.HandleFunc("/comments_by_connections", getCommentsByConnections).Methods("GET")
 	r.HandleFunc("/disconnect_users", disconnectUsers).Methods("DELETE")
 	r.HandleFunc("/comment_summary", getCommentSummary).Methods("GET")
+	r.HandleFunc("/analyze_sentiment",getScore).Methods("GET")
 	
 	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe("0.0.0.0:8080", r))
 }
 
 // CORS Middleware to allow cross-origin requests
@@ -138,9 +141,9 @@ func enableCORS(next http.Handler) http.Handler {
 		log.Println("CORS middleware triggered") 
 
 		
-		w.Header().Set("Access-Control-Allow-Origin", "*")  
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS") 
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization") 
+		//w.Header().Set("Access-Control-Allow-Origin", "*")  
+		//w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS") 
+		//w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization") 
 
 		
 		if r.Method == "OPTIONS" {
@@ -195,6 +198,43 @@ func connectUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "Users connected"})
 }
+
+func getScore(w http.ResponseWriter, r *http.Request) {
+        message := r.URL.Query().Get("message")
+
+        decodedmsg, err := url.QueryUnescape(message)
+        if err != nil {
+                http.Error(w, "Error decoding user ID", http.StatusBadRequest)
+                log.Println(err)
+                return
+        }
+	log.Println("score triggered")
+	url := "http://localhost:5000/analyze_sentiment"
+	requestBody := []byte(fmt.Sprintf(`{"text": ["%s"]}`, decodedmsg))
+
+	// Send request to ML model
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		http.Error(w, "Error calling sentiment analysis service", http.StatusInternalServerError)
+		log.Println("Error calling ML model:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read response from ML model
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Error reading response", http.StatusInternalServerError)
+		log.Println("Error reading response:", err)
+		return
+	}
+
+	// Send response back to client
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(responseBody)
+}
+
+
 
 func disconnectUsers(w http.ResponseWriter, r *http.Request) {
 	var request struct {
@@ -337,13 +377,13 @@ func getCommentsByConnections(w http.ResponseWriter, r *http.Request) {
 // Login route to create or fetch a user
 func login(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	username := vars["username"]
+	name := vars["username"]
 
-	log.Printf("Received login request for username: %s", username)
+	log.Printf("Received login request for mail: %s", name)
 
 	
 	var userID int
-	err := db.QueryRow("SELECT id FROM users WHERE username = ?", username).Scan(&userID)
+	err := db.QueryRow("SELECT id FROM users WHERE username = ?", name).Scan(&userID)
 
 	
 	if err == sql.ErrNoRows {
@@ -351,7 +391,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 		userID = generateRandomUserID()
 
 		
-		_, err := db.Exec("INSERT INTO users (id, username) VALUES (?, ?)", userID, username)
+		_, err := db.Exec("INSERT INTO users (id, username) VALUES (?, ?)", userID, name)
 		if err != nil {
 			http.Error(w, "Error creating user", http.StatusInternalServerError)
 			log.Println(err)
@@ -366,7 +406,8 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 // Generate a random 8-digit user ID
 func generateRandomUserID() int {
-	return 12345678 
+	rand.Seed(time.Now().UnixNano()) // Seed the random number generator
+	return rand.Intn(90000000) + 10000000 // Ensures an 8-digit number (10000000 - 99999999)
 }
 
 // Get comments for a specific URL
@@ -764,5 +805,4 @@ func commentLike(w http.ResponseWriter, r *http.Request) {
         log.Println(err)
     }
 }
-
 
